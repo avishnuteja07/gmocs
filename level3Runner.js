@@ -89,12 +89,12 @@ const LOCAL_TOOLS = {
 
 function getLocalSupportedLanguages() {
   const list = [];
-  if (LOCAL_TOOLS.python) list.push("python");
-  if (LOCAL_TOOLS.node) list.push("javascript");
-  if (LOCAL_TOOLS.gcc) list.push("c");
-  if (LOCAL_TOOLS.gpp) list.push("cpp");
-  if (LOCAL_TOOLS.csc && (process.platform === "win32" || LOCAL_TOOLS.mono)) list.push("csharp");
-  if (LOCAL_TOOLS.javac && LOCAL_TOOLS.java) list.push("java");
+  if (LocalExecutor.supports("python")) list.push("python");
+  if (LocalExecutor.supports("javascript")) list.push("javascript");
+  if (LocalExecutor.supports("c")) list.push("c");
+  if (LocalExecutor.supports("cpp")) list.push("cpp");
+  if (LocalExecutor.supports("csharp")) list.push("csharp");
+  if (LocalExecutor.supports("java")) list.push("java");
   return list;
 }
 
@@ -525,6 +525,8 @@ function spawnProcess(cmd, args, options = {}) {
  */
 class LocalExecutor {
   static supports(language) {
+    const disabled = (process.env.DISABLE_LOCAL_LANGUAGES || "").toLowerCase().split(",").map((s) => s.trim()).filter(Boolean);
+    if (disabled.includes(language)) return false;
     if (language === "python") return Boolean(LOCAL_TOOLS.python);
     if (language === "javascript") return Boolean(LOCAL_TOOLS.node);
     if (language === "c") return Boolean(LOCAL_TOOLS.gcc);
@@ -543,7 +545,7 @@ class LocalExecutor {
       if (res.ok && process.platform !== "win32") {
         try { await fs.promises.chmod(exe, 0o755); } catch {}
       }
-      return { ok: res.ok, exePath: exe, compileOutput: res.stderr || res.stdout, status: res.ok ? "Finished" : "Compilation Error" };
+      return { ok: res.ok, exePath: exe, compileOutput: res.stderr || res.stdout, status: res.timedOut ? "Time Limit Exceeded" : (res.ok ? "Finished" : "Compilation Error"), timedOut: Boolean(res.timedOut) };
     }
     if (language === "cpp") {
       const src = path.join(tempDir, "solution.cpp");
@@ -553,7 +555,7 @@ class LocalExecutor {
       if (res.ok && process.platform !== "win32") {
         try { await fs.promises.chmod(exe, 0o755); } catch {}
       }
-      return { ok: res.ok, exePath: exe, compileOutput: res.stderr || res.stdout, status: res.ok ? "Finished" : "Compilation Error" };
+      return { ok: res.ok, exePath: exe, compileOutput: res.stderr || res.stdout, status: res.timedOut ? "Time Limit Exceeded" : (res.ok ? "Finished" : "Compilation Error"), timedOut: Boolean(res.timedOut) };
     }
     if (language === "csharp") {
       const src = path.join(tempDir, "solution.cs");
@@ -564,7 +566,7 @@ class LocalExecutor {
         ? ["-nologo", "-optimize-", `-out:${exe}`, src]
         : ["/nologo", "/optimize-", `/out:${exe}`, src];
       const res = await spawnProcess(LOCAL_TOOLS.csc, args, { cwd: tempDir, timeout: 8000 });
-      return { ok: res.ok, exePath: exe, compileOutput: res.stderr || res.stdout, status: res.ok ? "Finished" : "Compilation Error" };
+      return { ok: res.ok, exePath: exe, compileOutput: res.stderr || res.stdout, status: res.timedOut ? "Time Limit Exceeded" : (res.ok ? "Finished" : "Compilation Error"), timedOut: Boolean(res.timedOut) };
     }
     if (language === "java") {
       let className = "Main";
@@ -577,9 +579,25 @@ class LocalExecutor {
       }
       const src = path.join(tempDir, `${className}.java`);
       await fs.promises.writeFile(src, source, "utf-8");
-      const res = await spawnProcess(LOCAL_TOOLS.javac, ["-encoding", "UTF-8", src], { cwd: tempDir, timeout: 8000 });
+      const javacArgs = [
+        "-J-Xms16m",
+        "-J-Xmx192m",
+        "-J-XX:+TieredCompilation",
+        "-J-XX:TieredStopAtLevel=1",
+        "-J-XX:CICompilerCount=2",
+        "-J-XX:ParallelGCThreads=1",
+        "-encoding",
+        "UTF-8",
+        src,
+      ];
+      const res = await spawnProcess(LOCAL_TOOLS.javac, javacArgs, { cwd: tempDir, timeout: 12000 });
       if (!res.ok) {
-        return { ok: false, compileOutput: res.stderr || res.stdout, status: "Compilation Error" };
+        return {
+          ok: false,
+          compileOutput: res.stderr || res.stdout,
+          status: res.timedOut ? "Time Limit Exceeded" : "Compilation Error",
+          timedOut: Boolean(res.timedOut),
+        };
       }
       const files = await fs.promises.readdir(tempDir);
       const classFiles = files.filter((f) => f.endsWith(".class")).map((f) => f.replace(".class", ""));
@@ -600,11 +618,25 @@ class LocalExecutor {
       return spawnProcess(compileInfo.exePath, [], { cwd: tempDir, input: stdin, timeout: 3000 });
     }
     if (language === "java") {
-      return spawnProcess(LOCAL_TOOLS.java, ["-Xmx128m", "-Xms32m", "-cp", compileInfo.tempDir, compileInfo.targetClass], {
-        cwd: compileInfo.tempDir,
-        input: stdin,
-        timeout: 3000,
-      });
+      return spawnProcess(
+        LOCAL_TOOLS.java,
+        [
+          "-Xms16m",
+          "-Xmx128m",
+          "-XX:+TieredCompilation",
+          "-XX:TieredStopAtLevel=1",
+          "-XX:CICompilerCount=2",
+          "-XX:ParallelGCThreads=1",
+          "-cp",
+          compileInfo.tempDir,
+          compileInfo.targetClass,
+        ],
+        {
+          cwd: compileInfo.tempDir,
+          input: stdin,
+          timeout: 4000,
+        }
+      );
     }
     throw new Error(`Unsupported binary language: ${language}`);
   }
@@ -646,6 +678,9 @@ class LocalExecutor {
       // Compiled languages:
       const comp = await this.compile(language, tempDir, source);
       if (!comp.ok) {
+        if (comp.timedOut) {
+          throw new Error(`Local compiler timed out for ${language}`);
+        }
         return {
           passed: false,
           stdout: "",
@@ -737,6 +772,9 @@ class LocalExecutor {
       // Compiled language (compile once, test 5 times)
       const comp = await this.compile(language, tempDir, source);
       if (!comp.ok) {
+        if (comp.timedOut) {
+          throw new Error(`Local compiler timed out for ${language}`);
+        }
         return tests.map((test, index) => ({
           label: test.public ? test.label : `Hidden test ${index + 1}`,
           public: Boolean(test.public),
@@ -747,10 +785,18 @@ class LocalExecutor {
         }));
       }
 
-      // Run 5 test cases concurrently against the compiled binary
-      const runs = await Promise.all(
-        tests.map((test) => this.runBinary(language, comp, test.input, tempDir))
-      );
+      // Run 5 test cases against the compiled binary (run sequentially for heavy runtimes like Java to avoid OOM on limited-memory cloud containers)
+      let runs;
+      if (language === "java" || language === "csharp") {
+        runs = [];
+        for (const test of tests) {
+          runs.push(await this.runBinary(language, comp, test.input, tempDir));
+        }
+      } else {
+        runs = await Promise.all(
+          tests.map((test) => this.runBinary(language, comp, test.input, tempDir))
+        );
+      }
 
       return tests.map((test, index) => {
         const run = runs[index];
@@ -815,7 +861,7 @@ class Judge0Executor {
         method: "POST",
         headers,
         body: JSON.stringify(limits),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(15000),
       });
       if (waitResp.ok) {
         const body = await waitResp.json();
@@ -841,7 +887,7 @@ class Judge0Executor {
         method: "POST",
         headers,
         body: JSON.stringify(limits),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(8000),
       });
       if (!createdResponse.ok) throw new Error(`Code runner HTTP error ${createdResponse.status}`);
       created = await createdResponse.json();
@@ -852,9 +898,9 @@ class Judge0Executor {
     resultUrl.searchParams.set("base64_encoded", "false");
     resultUrl.searchParams.set("fields", "stdout,stderr,compile_output,status_id,status,time,memory");
 
-    // Fast exponential backoff polling (50ms -> 75ms -> 100ms -> 150ms -> 250ms)
+    // Fast exponential backoff polling (50ms -> 75ms -> 100ms -> up to 500ms, up to 60 polls ~30s)
     let delay = 50;
-    for (let poll = 0; poll < 35; poll += 1) {
+    for (let poll = 0; poll < 60; poll += 1) {
       const resultResponse = await fetch(resultUrl, { headers, signal: AbortSignal.timeout(5000) });
       if (!resultResponse.ok) throw new Error(`Code runner HTTP error ${resultResponse.status}`);
       const result = await resultResponse.json();
@@ -872,7 +918,7 @@ class Judge0Executor {
         };
       }
       await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(300, Math.floor(delay * 1.35));
+      delay = Math.min(500, Math.floor(delay * 1.25));
     }
     throw new Error(`Judge0 timed out on ${cleanBase}`);
   }
@@ -937,9 +983,9 @@ class Judge0Executor {
     const tokens = created.map((item) => item.token);
     let results = [];
     let delay = 50;
-    for (let poll = 0; poll < 35; poll += 1) {
+    for (let poll = 0; poll < 60; poll += 1) {
       await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(300, Math.floor(delay * 1.35));
+      delay = Math.min(500, Math.floor(delay * 1.25));
       const resultUrl = new URL(`${cleanBase}/submissions/batch`);
       resultUrl.searchParams.set("tokens", tokens.join(","));
       resultUrl.searchParams.set("base64_encoded", "false");
@@ -983,7 +1029,9 @@ function getRunnerEndpoints() {
  * Executes a debug run across available engines with seamless fallback.
  */
 async function executeLevel3Debug(language, source, stdin) {
-  const preference = (process.env.RUNNER_PREFERENCE || "local,remote").toLowerCase().split(",");
+  const remotePreferred = (process.env.PREFER_REMOTE_LANGUAGES || "").toLowerCase().split(",").map((s) => s.trim()).filter(Boolean);
+  const defaultPref = remotePreferred.includes(language) ? "remote,local" : (process.env.RUNNER_PREFERENCE || "local,remote");
+  const preference = defaultPref.toLowerCase().split(",");
   const errors = [];
 
   for (const pref of preference) {
@@ -1029,7 +1077,9 @@ async function executeLevel3Debug(language, source, stdin) {
  * Executes all 5 test cases across available engines with seamless fallback.
  */
 async function executeLevel3Tests(questionId, language, source, mode = "program") {
-  const preference = (process.env.RUNNER_PREFERENCE || "local,remote").toLowerCase().split(",");
+  const remotePreferred = (process.env.PREFER_REMOTE_LANGUAGES || "").toLowerCase().split(",").map((s) => s.trim()).filter(Boolean);
+  const defaultPref = remotePreferred.includes(language) ? "remote,local" : (process.env.RUNNER_PREFERENCE || "local,remote");
+  const preference = defaultPref.toLowerCase().split(",");
   const errors = [];
 
   for (const pref of preference) {
