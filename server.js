@@ -119,9 +119,11 @@ async function currentUser(req) {
 async function currentAdmin(req) {
   const token = cookieValue(req, "mits_l1_admin");
   if (!token) return null;
+  const envAdmin = String(process.env.ADMIN_USERNAME || "").trim();
+  if (!envAdmin) return null;
   const session = await db.collection("admin_sessions").findOne({ tokenHash: hashToken(token), expiresAt: { $gt: new Date() } });
   if (!session) return null;
-  return db.collection("admins").findOne({ _id: session.adminId }, { projection: { username: 1 } });
+  return { username: envAdmin };
 }
 
 function normalizeAnswer(value) {
@@ -1045,12 +1047,24 @@ app.post("/api/admin/login", async (req, res, next) => {
   try {
     const username = String(req.body.username || "").trim();
     const password = String(req.body.password || "");
-    const admin = await db.collection("admins").findOne({ username });
-    if (!admin || !await passwordMatches(password, admin.passwordSalt, admin.passwordHash)) {
+    const envUsername = String(process.env.ADMIN_USERNAME || "").trim();
+    const envPassword = String(process.env.ADMIN_PASSWORD || "");
+
+    if (!envUsername || !envPassword) {
+      return res.status(500).json({ error: "ADMIN_USERNAME and ADMIN_PASSWORD are not configured in environment variables." });
+    }
+
+    if (username !== envUsername || password !== envPassword) {
       return res.status(401).json({ error: "Administrator username or password is incorrect." });
     }
+
     const token = crypto.randomBytes(32).toString("base64url");
-    await db.collection("admin_sessions").insertOne({ tokenHash: hashToken(token), adminId: admin._id, createdAt: new Date(), expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000) });
+    await db.collection("admin_sessions").insertOne({
+      tokenHash: hashToken(token),
+      username: envUsername,
+      createdAt: new Date(),
+      expiresAt: new Date(Date.now() + 8 * 60 * 60 * 1000)
+    });
     sessionCookie(res, "mits_l1_admin", token, 8 * 60 * 60);
     res.json({ ok: true });
   } catch (error) { next(error); }
@@ -1538,7 +1552,6 @@ async function start() {
   db = client.db(DB_NAME);
   await Promise.all([
     db.collection("users").createIndex({ registrationNumber: 1 }, { unique: true }),
-    db.collection("admins").createIndex({ username: 1 }, { unique: true }),
     db.collection("sessions").createIndex({ tokenHash: 1 }, { unique: true }),
     db.collection("sessions").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
     db.collection("admin_sessions").createIndex({ tokenHash: 1 }, { unique: true }),
@@ -1549,32 +1562,10 @@ async function start() {
   ]);
   const adminUsername = String(process.env.ADMIN_USERNAME || "").trim();
   const adminPassword = String(process.env.ADMIN_PASSWORD || "");
-  if (Boolean(adminUsername) !== Boolean(adminPassword)) {
-    throw new Error("Set both ADMIN_USERNAME and ADMIN_PASSWORD to bootstrap an administrator, or leave both unset.");
-  }
-  if (adminUsername) {
-    if (adminUsername.length > 80 || adminPassword.length < 8 || adminPassword.length > 1024) {
-      throw new Error("ADMIN_USERNAME must be 1–80 characters and ADMIN_PASSWORD must be 8–1024 characters.");
-    }
-    const admins = db.collection("admins");
-    const managedAdmin = await admins.findOne({ managedByEnv: true }) || await admins.findOne({ username: adminUsername });
-    if (managedAdmin) {
-      const credentialsUnchanged = managedAdmin.username === adminUsername
-        && await passwordMatches(adminPassword, managedAdmin.passwordSalt, managedAdmin.passwordHash);
-      if (credentialsUnchanged) {
-        if (!managedAdmin.managedByEnv) await admins.updateOne({ _id: managedAdmin._id }, { $set: { managedByEnv: true } });
-        console.log(`Kept administrator sessions for configured account: ${adminUsername}`);
-      } else {
-        const { passwordSalt, passwordHash } = await makePasswordHash(adminPassword);
-        await admins.updateOne({ _id: managedAdmin._id }, { $set: { username: adminUsername, passwordSalt, passwordHash, managedByEnv: true, updatedAt: nowSeconds() } });
-        await db.collection("admin_sessions").deleteMany({ adminId: managedAdmin._id });
-        console.log(`Updated administrator credentials from environment: ${adminUsername}`);
-      }
-    } else {
-      const { passwordSalt, passwordHash } = await makePasswordHash(adminPassword);
-      await admins.insertOne({ username: adminUsername, passwordSalt, passwordHash, managedByEnv: true, createdAt: nowSeconds() });
-      console.log(`Created administrator from configured ADMIN_USERNAME: ${adminUsername}`);
-    }
+  if (adminUsername && adminPassword) {
+    console.log(`Administrator authentication active from environment (.env): ${adminUsername}`);
+  } else {
+    console.warn("WARNING: ADMIN_USERNAME or ADMIN_PASSWORD is not set in environment.");
   }
   const server = app.listen(PORT, HOST, () => {
     console.log(`MITS login is available at http://${HOST}:${PORT}`);
