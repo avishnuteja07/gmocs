@@ -1,0 +1,23 @@
+{
+  "name": "mits-student-login",
+  "version": "2.0.0",
+  "private": true,
+  "description": "MITS student login and timed coding challenge app using Express and MongoDB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "add-admin": "node manage.js add-admin",
+    "users": "node manage.js list-users",
+    "add-user": "node manage.js add-user",
+    "list-attempts": "node manage.js list-attempts"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "mongodb": "^6.20.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  }
+}
